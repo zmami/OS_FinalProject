@@ -39,7 +39,7 @@ class HospitalStatistics:
         # Each day is 60 seconds in simulation time
         return min(int(elapsed_time / 60), 6)  # 0-6 for 7 days
 
-    def add_visit(self, patient: Patient):gO
+    def add_visit(self, patient: Patient):
         day = self.get_current_day()
         self.stats['visits'][day] += 1
 
