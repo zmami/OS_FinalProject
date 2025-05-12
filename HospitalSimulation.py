@@ -1,383 +1,1091 @@
-from sys import exit
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from random import randint, choice
-from signal import signal, SIGINT, SIGTERM
-from threading import Lock, Thread
-from time import time, sleep
+from queue import Queue, PriorityQueue, Empty
+from random import choice, randint, uniform, random
+from threading import Event, Lock, Semaphore, Thread
+from time import sleep, time
 
-from DiagnosticsDepartment import DiagnosticsDepartment
-from Doctor import Doctor
-from EmergencyDepartment import EmergencyDepartment
-from HospitalStatistics import HospitalStatistics
-from Nurse import Nurse
-from OS_FinalProject.MassCasualtyIncident import MassCasualtyIncident
-from Receptionist import Receptionist
-from Specialty import Specialty
-from SurgeryDepartment import SurgeryDepartment
+from Patient import Patient
+from Statistics import Statistics
 
 
 class HospitalSimulation:
-    def __init__(self):
-        print("Starting hospital simulation...")
-        self.receptionists = [Receptionist(i + 1) for i in range(6)]
+    def __init__(self, days=7, simulation_speed=1.0):
+        # Configurable parameters
+        self.days = days
+        self.simulation_speed = simulation_speed  # Higher values = faster simulation
+        self.current_day = 0
+        self.is_mci_day = False
+        self.mci_in_progress = False
 
-        # Set hospital reference for receptionists
-        for receptionist in self.receptionists:
-            receptionist.hospital = self
+        # Patient generation settings
+        self.patients_per_day = 100
+        self.ambulances_per_day = 50
+        self.mci_patients = 150
 
-        # Create regular departments with 10 doctors each
-        self.departments = {}
-        for specialty in [s for s in Specialty if s not in [Specialty.SURGERY, Specialty.DIAGNOSTICS]]:
-            doctors = [Doctor(f"{specialty.value[0]}{i + 1}", specialty) for i in range(10)]
-            nurses = [Nurse(f"{specialty.value[0]}N{i + 1}") for i in range(15)]  # 15 nurses per department
+        # Department settings
+        self.departments = {
+            "Cardiology": ["heart attack", "arrhythmia", "heart failure"],
+            "Neurology": ["stroke", "concussion", "seizure"],
+            "Orthopedics": ["broken arm", "broken leg", "sprained ankle", "fracture"],
+            "Pulmonology": ["pneumonia", "asthma", "bronchitis"],
+            "Gastroenterology": ["appendicitis", "ulcer", "food poisoning"],
+            "General Surgery": ["hernia", "gallstones"],
+            "Internal Medicine": ["high fever", "flu", "diabetes", "hypertension"]
+        }
 
-            # Assign nurses to doctors (some doctors get 2 nurses)
-            for i, doctor in enumerate(doctors):
-                nurse1 = nurses[i]
-                nurse2 = nurses[i + len(doctors)] if i < len(nurses) - len(doctors) else None
+        # Staff settings
+        self.doctors_per_department = 8
+        self.er_doctors = 60
+        self.receptionists = 5
+        self.nurses_per_doctor = 2
 
-                doctor.assigned_nurse = nurse1
-                nurse1.assigned_doctor = doctor
-                if nurse2:
-                    nurse2.assigned_doctor = doctor
-                doctor.hospital = self
+        # Generate realistic patient names
+        self.first_names = ["John", "Emma", "Michael", "Olivia", "William", "James", "Ava", "Benjamin"]
+        self.last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis"]
 
-            self.departments[specialty] = {
-                'doctors': doctors,
-                'nurses': nurses
-            }
+        # Initialize statistics
+        self.stats = Statistics()
 
-        # Create specialized departments
-        self.surgery_dept = SurgeryDepartment(num_surgeons=10, num_nurses=15)
-        self.diagnostics_dept = DiagnosticsDepartment(num_technicians=10, num_nurses=10)
+        # Initialize queues and resources
+        self.initialize_queues_and_resources()
 
-        # Set hospital reference for specialized departments
-        for surgeon in self.surgery_dept.surgeons:
-            surgeon.hospital = self
-        for tech in self.diagnostics_dept.technicians:
-            tech.hospital = self
+        # Thread lock
+        self.lock = Lock()
+        self.mci_lock = Lock()
 
-        # Create Emergency Department with 50 nurses
-        self.emergency_dept = EmergencyDepartment(num_doctors=50, num_nurses=50)
-        self.emergency_dept.set_hospital(self)  # Set hospital reference for ER doctors
+        # Event to signal simulation completion
+        self.simulation_complete = Event()
 
-        self.assessment_nurses = [Nurse(f"AN{i + 1}") for i in range(10)]  # More assessment nurses
-        self.waiting_room = deque()
-        self.running = True
-        self.simulation_time = 7 * 60  # One week = 7 minutes in real time
-        self.mci = None
-        self.mci_day = randint(1, 7)  # Random day for MCI to occur
-        self.stats = HospitalStatistics()
-        self.stats_lock = Lock()  # Add lock for statistics
-        self.threads = []  # Track all threads
+        # Current simulation time
+        self.current_time = 0
 
-        # Add signal handling
-        signal(SIGINT, self.signal_handler)
-        signal(SIGTERM, self.signal_handler)
+        # Special events tracking
+        self.code_blue_in_progress = False
+        self.code_blue_lock = Lock()
 
-        # Add thread pool
-        self.thread_pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix="Hospital")
+        # Available staff tracking
+        self.available_er_doctors = Semaphore(self.er_doctors)
+        self.available_er_nurses = Semaphore(self.er_doctors * self.nurses_per_doctor)
+        self.available_regular_doctors = {dept: Semaphore(self.doctors_per_department) for dept in
+                                          self.departments}
+        self.available_regular_nurses = {dept: Semaphore(self.doctors_per_department * self.nurses_per_doctor)
+                                         for dept in self.departments}
+        self.available_receptionists = Semaphore(self.receptionists)
 
-        # Start all medical staff threads
-        self._start_medical_staff()
+        # Regular doctor pool for MCI assistance
+        self.regular_doctors_helping_mci = Semaphore(0)  # Initially no regular doctors helping
+        self.mci_assistance_needed = Event()  # Signal for regular doctors to help
 
-    def _start_medical_staff(self):
-        """Start all doctor and nurse threads"""
-        # Start regular department staff
-        for dept in self.departments.values():
-            for doctor in dept['doctors']:
-                doctor.start_shift()
-            for nurse in dept['nurses']:
-                nurse.start_shift()
+    def initialize_queues_and_resources(self):
+        # Reception queue
+        self.reception_queue = Queue()
 
-        # Start ER staff
-        for doctor in self.emergency_dept.doctors:
-            doctor.start_shift()
-        for nurse in self.emergency_dept.nurses:
-            nurse.start_shift()
+        # Nurse assessment queues
+        self.assessment_queue = Queue()
 
-        # Start specialized department staff
-        for surgeon in self.surgery_dept.surgeons:
-            surgeon.start_shift()
-        for tech in self.diagnostics_dept.technicians:
-            tech.start_shift()
+        # Department doctor queues (FIFO)
+        self.department_queues = {dept: Queue() for dept in self.departments}
 
-        # Start assessment nurses
-        for nurse in self.assessment_nurses:
-            nurse.start_shift()
+        # ER doctor queues (priority)
+        self.er_queues = [PriorityQueue() for _ in range(self.er_doctors)]
 
-    def signal_handler(self, signum, frame):
-        """Handle termination signals"""
-        print("\n\nReceived termination signal. Shutting down simulation...")
-        self.cleanup()
-        exit(0)
+        # Testing queues
+        self.blood_work_queue = Queue()
+        self.xray_queue = Queue()
 
-    def cleanup(self):
-        """Enhanced cleanup with thread pool shutdown"""
-        print("Stopping all hospital operations...")
-        self.running = False
+        # Surgery queues
+        self.surgery_queue = Queue()
 
-        # Stop ambulance arrivals
-        if hasattr(self, 'emergency_dept'):
-            self.emergency_dept.ambulance_arrivals = False
+        # Ambulance queue
+        self.ambulance_queue = Queue()
 
-        # Stop MCI if active
-        if self.mci:
-            self.mci.is_active = False
+        # Code blue queue
+        self.code_blue_queue = Queue()
 
-        # Stop all medical staff
-        for dept in self.departments.values():
-            for doctor in dept['doctors']:
-                doctor.stop_shift()
-            for nurse in dept['nurses']:
-                nurse.stop_shift()
+        # MCI queue - for handling mass casualty incidents
+        self.mci_queue = PriorityQueue()
 
-        for doctor in self.emergency_dept.doctors:
-            doctor.stop_shift()
-        for nurse in self.emergency_dept.nurses:
-            nurse.stop_shift()
+    def simulate_time(self, seconds):
+        """Simulate the passage of time adjusted by simulation speed."""
+        scaled_time = seconds / self.simulation_speed
 
-        for surgeon in self.surgery_dept.surgeons:
-            surgeon.stop_shift()
-        for tech in self.diagnostics_dept.technicians:
-            tech.stop_shift()
+        # Add a minimum time cap to avoid excessive sleeping
+        scaled_time = min(scaled_time, 0.5)
 
-        for nurse in self.assessment_nurses:
-            nurse.stop_shift()
+        if scaled_time > 0:
+            sleep(scaled_time)
 
-        # Shutdown thread pool
-        self.thread_pool.shutdown(wait=True, cancel_futures=True)
+        # Always advance the simulation clock by the actual seconds
+        self.current_time += seconds
+        return seconds
 
-        # Wait for remaining threads
-        for thread in self.threads:
-            if thread and thread.is_alive():
-                try:
-                    thread.join(timeout=2)
-                except TimeoutError:
-                    print(f"Force terminating thread {thread.name}")
+    def generate_patient_name(self):
+        """Generate a random patient name."""
+        first_name = choice(self.first_names)
+        last_name = choice(self.last_names)
+        return f"{first_name} {last_name}"
 
-        print("All operations stopped. Simulation terminated.")
+    def assign_condition_and_severity(self, patient, is_mci=False):
+        """Assign a random condition and severity to a patient."""
+        # Flatten the conditions from all departments
+        all_conditions = []
+        for conditions in self.departments.values():
+            all_conditions.extend(conditions)
 
-    def patient_arrival(self):
-        start_time = time()
-        day = 0
-        patients_today = 0
-        current_receptionist = 0
+        if is_mci:
+            # MCI patients get trauma conditions
+            trauma_conditions = ["multiple trauma", "severe bleeding", "crush injury",
+                                 "head injury", "penetrating trauma", "blast injury"]
+            patient.condition = choice(trauma_conditions)
+            patient.severity = randint(8, 10)  # High severity for MCI patients
+            patient.is_mci_patient = True
+        else:
+            # Regular patient gets random condition
+            patient.condition = choice(all_conditions)
 
-        while self.running and (time() - start_time < self.simulation_time):
-            current_day = int((time() - start_time) / 60)
-
-            # Reset counter for new day
-            if current_day > day:
-                day = current_day
-                patients_today = 0
-                print(f"\nStarting Day {current_day + 1}")
-
-            # Process exactly 150 patients per day in smaller groups
-            if patients_today < 150:
-                # Process 15 patients every 6 seconds (10 groups of 15 = 150 per day)
-                group_size = 15
-                patients_today += group_size
-
-                for _ in range(group_size):
-                    age = randint(1, 100)
-                    # Round-robin assignment
-                    receptionist = self.receptionists[current_receptionist]
-                    current_receptionist = (current_receptionist + 1) % len(self.receptionists)
-                    patient = receptionist.register_patient(age)
-                    self.process_patient(patient)
-
-                # Wait 6 seconds between groups
-                sleep(6)  # This ensures even distribution across the minute
+            # Assign severity (1-10 scale, with 10 being most severe)
+            if self.is_mci_day and not self.mci_in_progress:
+                # During MCI day but not MCI event, normal distribution of severity
+                patient.severity = randint(1, 10)
+            elif self.is_mci_day and self.mci_in_progress:
+                # During MCI event, non-MCI patients less likely to have high severity
+                patient.severity = randint(1, 8)
             else:
-                # Wait for next day
-                sleep(0.1)
+                # Normal day
+                patient.severity = randint(1, 10)
 
-    def process_patient(self, patient):
-        def process():
-            try:
-                nurse = choice(self.assessment_nurses)
-                nurse.assess_patient(patient)
+        # Assign department based on condition
+        for dept, conditions in self.departments.items():
+            if patient.condition in conditions:
+                patient.department = dept
+                break
 
-                if patient.severity is None:
-                    return
-
-                specialty = Specialty.get_specialty_for_disease(patient.disease)
-
-                # Update statistics immediately
-                with self.stats_lock:
-                    self.stats.add_visit(patient)
-                    self.stats.add_condition(patient.disease)
-                    self.stats.add_department_visit(specialty)
-
-                    # Increase ER cases for severe patients
-                    if patient.severity >= 7:
-                        self.stats.add_er_patient()
-
-                    waiting_time = time() - patient.arrival_time
-                    self.stats.add_waiting_time(waiting_time)
-
-                # Route patients based on severity
+        # If no matching department found (e.g., for MCI trauma conditions)
+        if patient.department is None:
+            # Trauma cases go to orthopedics or ER depending on severity
+            if "trauma" in patient.condition or "injury" in patient.condition:
                 if patient.severity >= 8:
-                    self.handle_emergency(patient)
+                    # Handled in ER
+                    patient.department = "ER"
                 else:
-                    department = self.departments[specialty]
-                    doctor = min(department['doctors'], key=lambda d: d.patient_queue.qsize())
-                    priority = (-patient.severity, patient.arrival_time, patient)
-                    doctor.patient_queue.put(priority)
-
-            except Exception as e:
-                print(f"Error processing patient {patient.patient_id}: {e}")
-
-        self.thread_pool.submit(process)
-
-    def handle_emergency(self, patient):
-        arrival_time = time()
-        print(f"Emergency case! Patient {patient.patient_id} directed to ER")
-
-        try:
-            # Ensure patient has severity set
-            if patient.severity is None:
-                # Get a nurse to assess the patient first
-                nurse = choice(self.emergency_dept.nurses)
-                nurse.assess_patient(patient)
-
-            if patient.severity is None:
-                print(f"Error: Cannot process emergency patient {patient.patient_id} without severity!")
-                return
-
-            # Get available ER doctor with shortest queue
-            available_doctors = [d for d in self.emergency_dept.doctors if d.is_available]
-            if not available_doctors:
-                print("No ER doctors available! Patient waiting...")
-                return
-
-            doctor = min(available_doctors, key=lambda d: d.patient_queue.qsize())
-
-            # Add to priority queue with consistent tuple format
-            priority_tuple = (-patient.severity, patient.arrival_time, patient)
-            doctor.patient_queue.put(priority_tuple)
-
-            # Update statistics
-            waiting_time = time() - arrival_time
-            with self.stats_lock:
-                self.stats.add_waiting_time(waiting_time, is_mci=bool(self.mci))
-                self.stats.add_er_patient(is_mci=bool(self.mci))
-
-            # Treat patient
-            if doctor.treat_patient(patient):
-                self.stats.add_survival()
-                print(f"Emergency patient {patient.patient_id} has been stabilized and discharged")
+                    patient.department = "Orthopedics"
             else:
-                self.stats.add_death()
-                print(f"Emergency patient {patient.patient_id} treatment unsuccessful")
+                # Default to Internal Medicine
+                patient.department = "Internal Medicine"
 
-        except Exception as e:
-            print(f"Error handling emergency patient {patient.patient_id}: {e}")
+    def receptionist_thread(self):
+        """Handle patient registration."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Try to get a patient from the queue
+                patient_data = self.reception_queue.get(timeout=0.5)
 
-    def run(self):
-        """Start the hospital simulation"""
-        try:
-            print("Starting simulation for one week...")
-            print("Press Ctrl+C to stop the simulation at any time")
+                # Skip if we only got day info (no patient object)
+                if len(patient_data) < 2:
+                    self.reception_queue.task_done()
+                    continue
 
+                day, patient = patient_data
+
+                # Acquire a receptionist
+                if not self.available_receptionists.acquire(blocking=False):
+                    # If no receptionist available, put back in queue and try again later
+                    self.reception_queue.put(patient_data)
+                    self.reception_queue.task_done()
+                    continue
+
+                # Simulate registration time
+                registration_time = uniform(3, 6)
+                self.simulate_time(registration_time)
+
+                # Update patient record
+                patient.registration_time = time()
+
+                # Display registration message
+                print(f"📋 ({self.format_time()}) Patient {patient.name} registered")
+
+                # Send to nurse assessment
+                self.assessment_queue.put(patient)
+
+                # Release the receptionist
+                self.available_receptionists.release()
+
+                # Mark task as complete
+                self.reception_queue.task_done()
+            except Empty:
+                continue
+
+    def nurse_assessment_thread(self):
+        """Handle nurse assessment of patients."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Try to get a patient from the queue
+                patient = self.assessment_queue.get(timeout=0.5)
+
+                # Simulate assessment time 
+                assessment_time = uniform(30, 60)
+                self.simulate_time(assessment_time)
+
+                # Assign condition and severity if not already set (ambulance patients already have them)
+                if patient.condition is None:
+                    self.assign_condition_and_severity(patient)
+
+                # Update patient record
+                patient.assessment_time = time()
+
+                # Display assessment message
+                print(
+                    f"🩺 ({self.format_time()}) Nurse assessed {patient.name}: {patient.condition}, severity {patient.severity}")
+
+                # Route patient based on severity
+                if patient.severity >= 8:
+                    # ER patient - send to a random ER doctor queue
+                    er_queue_idx = randint(0, self.er_doctors - 1)
+                    self.er_queues[er_queue_idx].put(patient)
+                    print(f"🚨 ({self.format_time()}) Patient {patient.name} sent to ER")
+                else:
+                    # Regular patient - find appropriate department
+                    routed = False
+                    for dept, conditions in self.departments.items():
+                        if patient.condition in conditions:
+                            self.department_queues[dept].put(patient)
+                            print(f"🏥 ({self.format_time()}) Patient {patient.name} routed to {dept}")
+                            routed = True
+                            break
+
+                    # Default to Internal Medicine if no matching department
+                    if not routed:
+                        self.department_queues["Internal Medicine"].put(patient)
+                        print(f"🏥 ({self.format_time()}) Patient {patient.name} routed to Internal Medicine (default)")
+
+                # Mark task as complete
+                self.assessment_queue.task_done()
+            except Empty:
+                continue
+
+    def blood_work_thread(self):
+        """Handle blood work tests."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Try to get a patient from the queue
+                patient = self.blood_work_queue.get(timeout=0.5)
+
+                # Simulate blood work time
+                blood_work_time = uniform(5, 10)
+                self.simulate_time(blood_work_time)
+
+                # Update patient record
+                patient.had_blood_work = True
+
+                # Display blood work message
+                print(f"🩸 ({self.format_time()}) Blood work completed for {patient.name}")
+
+                # Check if patient also needed an X-ray
+                if hasattr(patient, 'needs_xray') and patient.needs_xray:
+                    self.xray_queue.put(patient)
+                else:
+                    # Continue to doctor
+                    if patient.severity >= 8:
+                        # Send back to ER
+                        er_queue_idx = randint(0, self.er_doctors - 1)
+                        self.er_queues[er_queue_idx].put(patient)
+                    else:
+                        # Send back to department
+                        self.department_queues[patient.department].put(patient)
+
+                # Mark task as complete
+                self.blood_work_queue.task_done()
+            except Empty:
+                continue
+
+    def xray_thread(self):
+        """Handle X-ray tests."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Try to get a patient from the queue
+                patient = self.xray_queue.get(timeout=0.5)
+
+                # Simulate X-ray time
+                xray_time = uniform(5, 10)
+                self.simulate_time(xray_time)
+
+                # Update patient record
+                patient.had_xray = True
+
+                # Display X-ray message
+                print(f"📷 ({self.format_time()}) X-ray completed for {patient.name}")
+
+                # Continue to doctor
+                if patient.severity >= 8:
+                    # Send back to ER
+                    er_queue_idx = randint(0, self.er_doctors - 1)
+                    self.er_queues[er_queue_idx].put(patient)
+                else:
+                    # Send back to department
+                    self.department_queues[patient.department].put(patient)
+
+                # Mark task as complete
+                self.xray_queue.task_done()
+            except Empty:
+                continue
+
+    def surgery_thread(self):
+        """Handle surgeries."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Try to get a patient from the queue
+                patient = self.surgery_queue.get(timeout=0.5)
+
+                # Simulate surgery time
+                surgery_time = uniform(10, 15)
+                self.simulate_time(surgery_time)
+
+                # Update patient record
+                patient.had_surgery = True
+
+                # Determine surgery outcome
+                death_chance = 0.25
+
+                # Increased death chance during MCI
+                if self.is_mci_day and self.mci_in_progress:
+                    death_chance = 0.40
+
+                    # Even higher chance for MCI patients
+                    if patient.is_mci_patient:
+                        death_chance = 0.50
+
+                if random() < death_chance:
+                    patient.dead = True
+                    patient.surgery_success = False
+                    print(f"💀 ({self.format_time()}) Surgery for {patient.name} failed. Patient died.")
+                else:
+                    patient.surgery_success = True
+                    print(f"✅ ({self.format_time()}) Surgery for {patient.name} successful.")
+
+                    # If successful, patient stays for recovery
+                    recovery_time = 5
+                    self.simulate_time(recovery_time)
+                    print(f"🛌 ({self.format_time()}) {patient.name} in post-surgery recovery.")
+
+                    # Nurse checks on patient
+                    self.simulate_time(2)
+                    print(f"👩‍⚕️ ({self.format_time()}) Nurse checked on {patient.name} after surgery.")
+
+                    # Discharge patient
+                    patient.discharge_time = time()
+                    print(f"🚶 ({self.format_time()}) {patient.name} discharged after surgery.")
+
+                # Record statistics for the current day
+                self.stats.record_visit(self.current_day, patient)
+
+                # If patient was an MCI patient, also record those stats
+                if patient.is_mci_patient:
+                    self.stats.record_mci_patient(patient)
+
+                # Mark task as complete
+                self.surgery_queue.task_done()
+            except Empty:
+                continue
+
+    def code_blue_thread(self):
+        """Handle Code Blue emergencies."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Try to get a patient from the queue
+                patient = self.code_blue_queue.get(timeout=0.5)
+
+                with self.code_blue_lock:
+                    self.code_blue_in_progress = True
+                    print(f"⚠️ ({self.format_time()}) CODE BLUE initiated for {patient.name}")
+
+                    # Acquire 2 ER doctors and 1 nurse
+                    for _ in range(2):
+                        self.available_er_doctors.acquire(timeout=1)
+                    self.available_er_nurses.acquire(timeout=1)
+
+                    # Handle Code Blue event
+                    self.simulate_time(8)  # Code Blue response time
+
+                    # Determine outcome 
+                    if random() < 0.20:  # 20% survival rate 
+                        patient.code_blue_success = True
+                        print(f"✅ ({self.format_time()}) CODE BLUE successful for {patient.name}. Patient stabilized.")
+                    else:
+                        patient.code_blue_success = False
+                        patient.dead = True
+                        print(f"💀 ({self.format_time()}) CODE BLUE unsuccessful for {patient.name}. Patient died.")
+
+                    # Update patient record
+                    patient.had_code_blue = True
+
+                    # Release the doctors and nurse
+                    for _ in range(2):
+                        try:
+                            self.available_er_doctors.release()
+                        except:
+                            pass
+                    try:
+                        self.available_er_nurses.release()
+                    except:
+                        pass
+
+                    self.code_blue_in_progress = False
+
+                # If patient survived, continue treatment
+                if not patient.dead:
+                    er_queue_idx = randint(0, self.er_doctors - 1)
+                    self.er_queues[er_queue_idx].put(patient)
+                else:
+                    # Record statistics for the dead patient
+                    self.stats.record_visit(self.current_day, patient)
+
+                    # If patient was an MCI patient, also record those stats
+                    if patient.is_mci_patient:
+                        self.stats.record_mci_patient(patient)
+
+                # Mark task as complete
+                self.code_blue_queue.task_done()
+            except Empty:
+                continue
+            except Exception as e:
+                # Ensure the code blue in progress flag is reset if an error occurs
+                self.code_blue_in_progress = False
+                continue
+
+    def ambulance_thread(self):
+        """Handle ambulance arrivals."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Try to get an ambulance from the queue
+                ambulance_data = self.ambulance_queue.get(timeout=0.5)
+                day, _ = ambulance_data
+
+                # Create a new patient
+                patient = Patient(self.generate_patient_name(), time())
+                patient.came_by_ambulance = True
+
+                # Try to acquire an ER doctor and nurse
+                doctor_acquired = self.available_er_doctors.acquire(timeout=1)
+                nurse_acquired = self.available_er_nurses.acquire(timeout=1)
+
+                # Simulate ambulance handling time
+                self.simulate_time(uniform(3, 6))
+
+                # Assign condition and severity
+                self.assign_condition_and_severity(patient)
+
+                # Force severity to be high for ambulance patients
+                if patient.severity < 7:
+                    patient.severity = randint(7, 10)
+
+                print(
+                    f"🚑 ({self.format_time()}) Ambulance arrived with {patient.name}: {patient.condition}, severity {patient.severity}")
+
+                # Release the doctor and nurse if acquired
+                if doctor_acquired:
+                    try:
+                        self.available_er_doctors.release()
+                    except:
+                        pass
+                if nurse_acquired:
+                    try:
+                        self.available_er_nurses.release()
+                    except:
+                        pass
+
+                # Send to appropriate ER queue
+                er_queue_idx = randint(0, self.er_doctors - 1)
+                self.er_queues[er_queue_idx].put(patient)
+
+                # Mark ambulance task as complete
+                self.ambulance_queue.task_done()
+            except Empty:
+                continue
+            except Exception:
+                # Continue even if there's an error
+                continue
+
+    def mci_assistant_thread(self, department):
+        """Thread for regular department doctors helping during MCI."""
+        while not self.simulation_complete.is_set():
+            # Wait for signal that MCI assistance is needed
+            if not self.mci_assistance_needed.is_set():
+                sleep(0.1)
+                continue
+
+            # Try to acquire a regular doctor from this department
+            if self.available_regular_doctors[department].acquire(blocking=False):
+                # Signal that this doctor is now helping with MCI
+                try:
+                    self.regular_doctors_helping_mci.release()
+                except:
+                    pass
+
+                # Keep doctor occupied with MCI until it's over
+                while self.mci_in_progress and not self.simulation_complete.is_set():
+                    try:
+                        # Try to get a patient from MCI queue
+                        patient = self.mci_queue.get(timeout=0.5)
+
+                        # Mark the time doctor starts seeing patient
+                        patient.doctor_start_time = time()
+
+                        # Calculate waiting time
+                        patient.waiting_time = patient.doctor_start_time - patient.arrival_time
+
+                        # Simulate doctor examination time
+                        examination_time = uniform(5, 10)
+                        self.simulate_time(examination_time)
+
+                        print(
+                            f"👨‍⚕️ ({self.format_time()}) Doctor from {department} examined MCI patient {patient.name}")
+
+                        # Higher chance for surgery for MCI patients
+                        surgery_needed = random() < 0.50  # 50% chance for surgery
+
+                        if surgery_needed:
+                            print(f"🔪 ({self.format_time()}) MCI patient {patient.name} needs surgery")
+                            self.surgery_queue.put(patient)
+                        else:
+                            # No surgery needed
+                            patient.doctor_end_time = time()
+
+                            # Determine if patient survives (higher death chance during MCI)
+                            if random() < 0.30:  # 30% chance of death without surgery 
+                                patient.dead = True
+                                print(f"💀 ({self.format_time()}) MCI patient {patient.name} died during treatment")
+                            else:
+                                patient.discharge_time = time()
+                                print(f"🚶 ({self.format_time()}) MCI patient {patient.name} discharged after treatment")
+
+                            # Record visit statistics
+                            self.stats.record_visit(self.current_day, patient)
+                            self.stats.record_mci_patient(patient)
+
+                        # Mark task as done
+                        self.mci_queue.task_done()
+                    except Empty:
+                        # No MCI patients right now, wait a bit
+                        sleep(0.1)
+
+                # MCI is over, return doctor to regular duties
+                try:
+                    self.available_regular_doctors[department].release()
+                    print(f"👨‍⚕️ ({self.format_time()}) Doctor from {department} returned to regular duties after MCI")
+                except:
+                    pass
+
+    def regular_doctor_thread(self, department):
+        """Thread for regular department doctors."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Acquire a doctor from the department
+                if not self.available_regular_doctors[department].acquire(timeout=0.5):
+                    continue
+
+                # If MCI is in progress and assistance is needed, this doctor might be reassigned
+                if self.is_mci_day and self.mci_in_progress and self.mci_assistance_needed.is_set():
+                    # 30% chance for regular doctors to be reassigned to MCI
+                    if random() < 0.30:
+                        # Release the doctor slot to be handled by mci_assistant_thread
+                        try:
+                            self.available_regular_doctors[department].release()
+                        except:
+                            pass
+                        sleep(0.1)  # Wait a bit before trying again
+                        continue
+
+                # Try to get a patient from the department queue
+                try:
+                    patient = self.department_queues[department].get(timeout=0.5)
+                except Empty:
+                    # If no patients, release the doctor
+                    try:
+                        self.available_regular_doctors[department].release()
+                    except:
+                        pass
+                    continue
+
+                # Mark the time doctor starts seeing patient
+                patient.doctor_start_time = time()
+
+                # Calculate waiting time
+                patient.waiting_time = patient.doctor_start_time - patient.arrival_time
+
+                # Simulate doctor examination time 
+                examination_time = uniform(20, 40)
+                self.simulate_time(examination_time)
+
+                print(f"👨‍⚕️ ({self.format_time()}) Doctor in {department} examined {patient.name}")
+
+                # Check if surgery is needed 
+                surgery_needed = random() < 0.30
+
+                if surgery_needed:
+                    print(f"🔪 ({self.format_time()}) {patient.name} needs surgery")
+                    self.surgery_queue.put(patient)
+                else:
+                    # No surgery needed, patient can be discharged
+                    patient.doctor_end_time = time()
+                    patient.discharge_time = time()
+                    print(f"🚶 ({self.format_time()}) {patient.name} discharged from {department}")
+
+                    # Record visit statistics
+                    self.stats.record_visit(self.current_day, patient)
+
+                # Release the doctor
+                try:
+                    self.available_regular_doctors[department].release()
+                except:
+                    pass
+
+                # Mark task as done
+                self.department_queues[department].task_done()
+            except Exception:
+                # If there's an error, make sure to release the doctor
+                try:
+                    self.available_regular_doctors[department].release()
+                except:
+                    pass
+                continue
+
+    def er_doctor_thread(self, queue_idx):
+        """Thread for ER doctors."""
+        while not self.simulation_complete.is_set():
+            try:
+                # Acquire an ER doctor
+                if not self.available_er_doctors.acquire(timeout=0.5):
+                    continue
+
+                # Check if there's an MCI patient with priority
+                mci_patient = None
+                if self.is_mci_day and self.mci_in_progress:
+                    try:
+                        # Try to get an MCI patient without blocking
+                        mci_patient = self.mci_queue.get(block=False)
+                    except Empty:
+                        pass
+
+                if mci_patient:
+                    # We got an MCI patient, treat them
+                    patient = mci_patient
+                else:
+                    # No MCI patient, get next from regular ER queue
+                    try:
+                        patient = self.er_queues[queue_idx].get(timeout=0.5)
+                    except Empty:
+                        # No patients in queue, release doctor and continue
+                        try:
+                            self.available_er_doctors.release()
+                        except:
+                            pass
+                        continue
+
+                # Mark the time doctor starts seeing patient
+                patient.doctor_start_time = time()
+
+                # Calculate waiting time
+                patient.waiting_time = patient.doctor_start_time - patient.arrival_time
+
+                # Check for Code Blue event 
+                code_blue = random() < 0.15
+
+                if code_blue and not self.code_blue_in_progress:
+                    print(f"⚠️ ({self.format_time()}) Code Blue initiated for {patient.name}")
+                    self.code_blue_queue.put(patient)
+
+                    # Release the doctor for now
+                    try:
+                        self.available_er_doctors.release()
+                    except:
+                        pass
+
+                    # Mark task as done
+                    if mci_patient:
+                        self.mci_queue.task_done()
+                    else:
+                        self.er_queues[queue_idx].task_done()
+                    continue
+
+                # Check if patient needs tests before seeing doctor (50% chance)
+                tests_needed = random() < 0.50
+
+                if tests_needed:
+                    # Needs blood work, x-ray, or both
+                    needs_blood_work = choice([True, False])
+                    needs_xray = choice([True, False])
+
+                    if not needs_blood_work and not needs_xray:
+                        needs_blood_work = True  # Ensure at least one test is needed
+
+                    patient.needs_blood_work = needs_blood_work
+                    patient.needs_xray = needs_xray
+
+                    if needs_blood_work and needs_xray:
+                        print(f"🔬 ({self.format_time()}) ER patient {patient.name} needs both blood work and X-ray")
+                        patient.needs_xray = True  # Flag for blood work thread to send to X-ray after
+                        self.blood_work_queue.put(patient)
+                    elif needs_blood_work:
+                        print(f"🔬 ({self.format_time()}) ER patient {patient.name} needs blood work")
+                        self.blood_work_queue.put(patient)
+                    elif needs_xray:
+                        print(f"🔬 ({self.format_time()}) ER patient {patient.name} needs X-ray")
+                        self.xray_queue.put(patient)
+
+                    # Release the doctor while patient gets tests
+                    try:
+                        self.available_er_doctors.release()
+                    except:
+                        pass
+
+                    # Mark task as done
+                    if mci_patient:
+                        self.mci_queue.task_done()
+                    else:
+                        self.er_queues[queue_idx].task_done()
+                    continue
+
+                # Simulate doctor examination time
+                examination_time = uniform(5, 10)
+                self.simulate_time(examination_time)
+
+                print(f"👨‍⚕️ ({self.format_time()}) ER Doctor examined {patient.name}")
+
+                # Check if surgery is needed
+                # For MCI patients, higher chance of surgery
+                if patient.is_mci_patient:
+                    surgery_needed = random() < 0.50
+                else:
+                    surgery_needed = random() < 0.30
+
+                if surgery_needed:
+                    print(f"🔪 ({self.format_time()}) ER patient {patient.name} needs surgery")
+                    self.surgery_queue.put(patient)
+                else:
+                    # No surgery needed, patient can be discharged
+                    patient.doctor_end_time = time()
+                    patient.discharge_time = time()
+
+                    # For MCI patients, higher chance of death even without surgery
+                    if patient.is_mci_patient and random() < 0.30:
+                        patient.dead = True
+                        print(f"💀 ({self.format_time()}) MCI patient {patient.name} died during treatment")
+                    else:
+                        print(f"🚶 ({self.format_time()}) ER patient {patient.name} discharged")
+
+                    # Record visit statistics
+                    self.stats.record_visit(self.current_day, patient)
+
+                    # If patient was an MCI patient, also record those stats
+                    if patient.is_mci_patient:
+                        self.stats.record_mci_patient(patient)
+
+                # Release the doctor
+                try:
+                    self.available_er_doctors.release()
+                except:
+                    pass
+
+                # Mark task as done
+                if mci_patient:
+                    self.mci_queue.task_done()
+                else:
+                    self.er_queues[queue_idx].task_done()
+            except Exception:
+                # If there's an error, make sure to release the doctor
+                try:
+                    self.available_er_doctors.release()
+                except:
+                    pass
+                continue
+
+    def generate_regular_patients(self, day):
+        """Generate regular patients throughout the day."""
+        # Get interval between patient arrivals (scaled by simulation speed)
+        interval = 5
+
+        # Number of patients depends on MCI status
+        num_patients = self.patients_per_day
+        if self.is_mci_day and self.mci_in_progress:
+            # Fewer regular patients during MCI (people avoid hospital during disasters)
+            num_patients = int(self.patients_per_day * 0.5)
+
+        for i in range(num_patients):
+            if self.simulation_complete.is_set():
+                break
+
+            # Create a new patient
+            patient = Patient(self.generate_patient_name(), time())
+
+            # Send to reception
+            self.reception_queue.put((day, patient))
+
+            # Wait for next patient
+            self.simulate_time(interval)
+
+    def generate_ambulance_arrivals(self, day):
+        """Generate ambulance arrivals throughout the day."""
+        # Get interval between ambulance arrivals (scaled by simulation speed)
+        interval = 15
+
+        # Number of ambulances depends on MCI status
+        num_ambulances = self.ambulances_per_day
+        if self.is_mci_day and self.mci_in_progress:
+            # More ambulances during MCI
+            num_ambulances = int(self.ambulances_per_day * 2)
+
+        for i in range(num_ambulances):
+            if self.simulation_complete.is_set():
+                break
+
+            # Send ambulance to queue
+            self.ambulance_queue.put((day, i))
+
+            # Wait for next ambulance
+            self.simulate_time(interval)
+
+    def generate_mci_patients(self):
+        """Generate a surge of patients during Mass Casualty Incident."""
+        with self.mci_lock:
+            self.mci_in_progress = True
+            print(f"\n🚨 MASS CASUALTY INCIDENT DECLARED on Day {self.current_day + 1} 🚨")
+
+            # Signal that regular doctors should help with MCI
+            self.mci_assistance_needed.set()
+
+            # Wait for some regular doctors to be available for help
+            self.simulate_time(5)  # Give time for doctors to respond
+
+            # Generate MCI patients (faster than normal for simulation speed)
+            batch_size = 5  # Process in batches for speed
+            for i in range(0, self.mci_patients, batch_size):
+                if self.simulation_complete.is_set():
+                    break
+
+                # Create a batch of patients
+                for j in range(min(batch_size, self.mci_patients - i)):
+                    # Create a new patient with high severity
+                    patient = Patient(self.generate_patient_name(), time())
+
+                    # Assign as MCI patient with trauma condition
+                    self.assign_condition_and_severity(patient, is_mci=True)
+
+                    # Send directly to MCI queue
+                    self.mci_queue.put(patient)
+
+                # Brief interval between batches
+                self.simulate_time(2)
+
+            print(f"🚨 MCI patient surge complete. Total: {self.mci_patients} patients")
+
+            # Wait for most MCI queue to be processed (with timeout to prevent hanging)
             start_time = time()
-            end_time = start_time + self.simulation_time  # 7 minutes total
+            timeout = 10  # Seconds to wait for MCI queue processing
 
-            # Start regular patient arrivals
-            patient_thread = Thread(target=self.patient_arrival, name="PatientArrival")
-            patient_thread.daemon = True
-            patient_thread.start()
+            while not self.mci_queue.empty() and time() - start_time < timeout:
+                self.simulate_time(1)
 
-            # Start ambulance arrivals
-            ambulance_thread = self.emergency_dept.start_ambulance_arrivals(self)
-
-            # Add threads to tracking list
-            self.threads.extend([patient_thread, ambulance_thread])
-
-            # Monitor for MCI day and show progress
-            mci_thread = None
-            while self.running and time() <= end_time:  # Changed < to <= to include full last day
-                current_time = time() - start_time
-                current_day = int(current_time / 60) + 1  # Each day is 1 minute
-                progress = (current_time / self.simulation_time) * 100
-
-                # Clear line and show progress
-                print(f"\rSimulation Progress: Day {current_day}/7 ({progress:.1f}%)", end="")
-
-                # Start MCI on the designated day
-                if current_day == self.mci_day and not self.mci:
-                    print("\n")  # New line for MCI message
-                    self.mci = MassCasualtyIncident(self)
-                    mci_thread = self.mci.start_mci()
-                    self.threads.append(mci_thread)
-
-                # End MCI after the day is over
-                elif current_day > self.mci_day and self.mci:
-                    self.mci.is_active = False
-                    if mci_thread:
-                        mci_thread.join(timeout=2)
-                    print("\n🏥 Mass Casualty Incident response completed")
-                    self.mci = None
-
-                # Only end after day 7 is fully complete
-                if current_time >= self.simulation_time:  # Changed condition to ensure full 7 days
-                    print("\nDay 7 completed. Ending simulation...")
-                    self.running = False
+            # Force completion even if not all patients were processed
+            while not self.mci_queue.empty():
+                try:
+                    patient = self.mci_queue.get_nowait()
+                    # Mark as dead for statistics
+                    patient.dead = True
+                    self.stats.record_visit(self.current_day, patient)
+                    self.stats.record_mci_patient(patient)
+                    self.mci_queue.task_done()
+                except:
                     break
 
-                sleep(1)  # Check progress every second
+            # MCI is over
+            print(f"🚨 Mass Casualty Incident has been resolved on Day {self.current_day + 1}.")
+            self.mci_in_progress = False
+            self.mci_assistance_needed.clear()
 
-            # Give extra time for day 7 to complete all processes
-            print("\nFinalizing day 7 operations...")
-            sleep(10)  # Allow time for final ambulances and treatments
+    def format_time(self):
+        """Format the current simulation time as Day/Hour:Minute."""
+        day = self.current_day + 1
+        seconds_in_day = self.current_time % (24 * 60 * 60)
+        hours = int(seconds_in_day / 3600)
+        minutes = int((seconds_in_day % 3600) / 60)
+        return f"Day {day} {hours:02d}:{minutes:02d}"
 
-            # Wait for all threads to complete
-            print("\nWaiting for all ongoing treatments to complete...")
+    def simulate_day(self, day):
+        """Simulate a full day in the hospital."""
+        self.current_day = day
+        self.current_time = day * 24 * 60 * 60  # Day start time in seconds
 
-            # Check patient queues
-            all_doctors = (
-                    list(self.emergency_dept.doctors) +
-                    list(self.surgery_dept.surgeons) +
-                    list(self.diagnostics_dept.technicians)
-            )
-            for dept in self.departments.values():
-                all_doctors.extend(dept['doctors'])
+        # Check if this is the MCI day
+        self.is_mci_day = (day == self.stats.mci_day)
+        self.mci_in_progress = False
 
-            # Wait for queues to empty and doctors to finish
-            max_wait = 60  # Maximum 60 seconds to wait
-            wait_start = time()
-            while time() - wait_start < max_wait:
-                queues_empty = all(doctor.patient_queue.empty() for doctor in all_doctors)
-                doctors_free = all(not doctor.is_busy for doctor in all_doctors)
+        print(f"\n🏥 === Day {day + 1} Starting === 🏥")
+        if self.is_mci_day:
+            print(f"⚠️ This is the Mass Casualty Incident day!")
 
-                if queues_empty and doctors_free:
-                    print("All patients have been treated.")
-                    break
-                sleep(1)
+        # Start threads for the day
+        threads = []
 
-            # Final check for any active threads
-            active_threads = [t for t in self.threads if t and t.is_alive()]
-            if active_threads:
-                print(f"Waiting for {len(active_threads)} active threads to complete...")
-                for thread in active_threads:
-                    thread.join(timeout=2)
+        # Start receptionist threads
+        for i in range(self.receptionists):
+            thread = Thread(target=self.receptionist_thread)
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
 
-            print("Simulation ended. All operations completed.")
+        # Start nurse assessment threads
+        for i in range(self.receptionists):
+            thread = Thread(target=self.nurse_assessment_thread)
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
 
-        except KeyboardInterrupt:
-            print("\nSimulation interrupted by user...")
-        except Exception as e:
-            print(f"\nError during simulation: {e}")
-        finally:
-            # Ensure proper cleanup at the end
-            self.running = False
-            self.cleanup()
+        # Start blood work and X-ray threads
+        for i in range(3):
+            thread = Thread(target=self.blood_work_thread)
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
 
-            if self.stats:
-                total_time = time() - start_time
-                print(f"\nSimulation ran for {total_time / 60:.1f} minutes of real time")
-                print("Generating statistics...")
-                self.stats.visualize_statistics()
-                print("Statistics saved to 'hospital_statistics.png'")
+        for i in range(2):
+            thread = Thread(target=self.xray_thread)
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
+
+        # Start surgery threads
+        for i in range(5):
+            thread = Thread(target=self.surgery_thread)
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
+
+        # Start code blue thread
+        code_blue_thread = Thread(target=self.code_blue_thread)
+        code_blue_thread.daemon = True
+        code_blue_thread.start()
+        threads.append(code_blue_thread)
+
+        # Start ambulance thread
+        ambulance_thread = Thread(target=self.ambulance_thread)
+        ambulance_thread.daemon = True
+        ambulance_thread.start()
+        threads.append(ambulance_thread)
+
+        # Start MCI assistant threads for each department
+        if self.is_mci_day:
+            for dept in self.departments:
+                thread = Thread(target=self.mci_assistant_thread, args=(dept,))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+
+        # Start regular doctor threads for each department
+        for dept in self.departments:
+            for i in range(self.doctors_per_department):
+                thread = Thread(target=self.regular_doctor_thread, args=(dept,))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+
+        # Start ER doctor threads
+        for i in range(self.er_doctors):
+            thread = Thread(target=self.er_doctor_thread, args=(i,))
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
+
+        # Start patient and ambulance generation
+        patient_thread = Thread(target=self.generate_regular_patients, args=(day,))
+        patient_thread.daemon = True
+        patient_thread.start()
+
+        ambulance_gen_thread = Thread(target=self.generate_ambulance_arrivals, args=(day,))
+        ambulance_gen_thread.daemon = True
+        ambulance_gen_thread.start()
+
+        # Start MCI if this is the MCI day (after a delay)
+        if self.is_mci_day:
+            # MCI starts after a short delay
+            self.simulate_time(20)  # Very short delay for fast simulation
+
+            # Generate MCI patients
+            mci_thread = Thread(target=self.generate_mci_patients)
+            mci_thread.daemon = True
+            mci_thread.start()
+
+            # Wait for MCI thread but with timeout to prevent hanging
+            mci_thread.join(timeout=10)
+
+        # Short wait for patient generation
+        try:
+            patient_thread.join(timeout=5)
+            ambulance_gen_thread.join(timeout=5)
+        except:
+            pass
+
+        # Wait for all queues to be empty or timeout
+        all_queues = [
+            self.reception_queue,
+            self.assessment_queue,
+            self.blood_work_queue,
+            self.xray_queue,
+            self.surgery_queue,
+            self.ambulance_queue,
+            self.code_blue_queue,
+            self.mci_queue
+        ]
+        all_queues.extend(self.department_queues.values())
+        all_queues.extend(self.er_queues)
+
+        # Wait until all queues are empty (with timeout)
+        max_wait_time = 30
+        start_wait_time = time()
+
+        while any(not q.empty() for q in all_queues):
+            self.simulate_time(1)  # Check every 1 simulated seconds
+
+            # Add a timeout mechanism to prevent infinite waiting
+            if time() - start_wait_time > max_wait_time:
+                print(f"⚠️ Timeout reached for day {day + 1}, forcing day completion")
+                # Force-empty any remaining queues
+                for q in all_queues:
+                    try:
+                        while not q.empty():
+                            q.get_nowait()
+                            q.task_done()
+                    except:
+                        pass
+                break
+
+        print(f"\n✅ Day {day + 1} complete!")
+
+    def run_simulation(self):
+        """Run the full hospital simulation for multiple days."""
+        print("🏥 Multi-Day Hospital Simulation Started 🏥")
+
+        # Set a timeout for the entire simulation
+        simulation_start = time()
+        timeout = 300
+
+        for day in range(self.days):
+            # Check for timeout
+            if time() - simulation_start > timeout:
+                print("⚠️ Simulation timeout reached, generating final statistics...")
+                break
+
+            # Run simulation for this day
+            self.simulate_day(day)
+
+            # Add a small delay between days to ensure proper completion
+            sleep(1)
+
+        # Signal simulation completion
+        self.simulation_complete.set()
+
+        # Give threads more time to terminate
+        sleep(2)
+
+        # Visualize the data
+        self.stats.visualize_data()
+
+        print("\n🏥 Hospital Simulation Complete 🏥")
